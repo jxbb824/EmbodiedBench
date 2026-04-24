@@ -14,7 +14,7 @@ from embodiedbench.planner.planner_utils import convert_format_2claude, convert_
                                              ActionPlan_1_manip, ActionPlan_manip, ActionPlan_lang_manip, fix_json
 
 temperature = 0
-max_completion_tokens = 4096
+max_completion_tokens = 40960
 remote_url = os.environ.get('remote_url')
 
 class RemoteModel:
