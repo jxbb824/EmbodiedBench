@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${ROOT_DIR}/logs"
-SERVER_URL="${SERVER_URL:-http://127.0.0.1:23333/process}"
+REMOTE_URL="${REMOTE_URL:-http://127.0.0.1:23333/v1}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-9B}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
@@ -48,13 +48,13 @@ PY
       return 0
     fi
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-      echo "[error] server.py exited before becoming ready. See ${LOG_DIR}/qwen_server.log"
+      echo "[error] vLLM server exited before becoming ready. See ${LOG_DIR}/qwen_server.log"
       return 1
     fi
     sleep "${delay}"
   done
 
-  echo "[error] server.py did not become ready after $((retries * delay)) seconds. See ${LOG_DIR}/qwen_server.log"
+  echo "[error] vLLM server did not become ready after $((retries * delay)) seconds. See ${LOG_DIR}/qwen_server.log"
   return 1
 }
 
@@ -67,9 +67,14 @@ X_PID=$!
 
 sleep 5
 
-echo "[start] launching Qwen server on CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} with MODEL_PATH=${MODEL_PATH}..."
+echo "[start] launching vLLM server on CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} with MODEL_PATH=${MODEL_PATH}..."
 activate_env hf
-MODEL_PATH="${MODEL_PATH}" CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" python server.py >"${LOG_DIR}/qwen_server.log" 2>&1 &
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" vllm serve "${MODEL_PATH}" \
+  --host 0.0.0.0 --port 23333 \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --max-model-len 8192 \
+  >"${LOG_DIR}/qwen_server.log" 2>&1 &
 SERVER_PID=$!
 
 echo "[wait] waiting for Qwen server..."
@@ -77,7 +82,7 @@ wait_for_server
 
 echo "[run] starting EB-ALFRED evaluation..."
 activate_env embench
-export server_url="${SERVER_URL}"
-python -m embodiedbench.main env=eb-alf model_name="${MODEL_PATH}" model_type=custom exp_name=baseline >"${LOG_DIR}/eb_alf_eval.log" 2>&1
+export remote_url="${REMOTE_URL}"
+python -m embodiedbench.main env=eb-alf model_name="${MODEL_PATH}" model_type=remote exp_name=vllm_baseline >"${LOG_DIR}/eb_alf_eval.log" 2>&1
 
 echo "[done] EB-ALFRED evaluation finished. Logs are in ${LOG_DIR}"

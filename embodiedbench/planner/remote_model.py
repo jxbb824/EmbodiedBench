@@ -14,7 +14,7 @@ from embodiedbench.planner.planner_utils import convert_format_2claude, convert_
                                              ActionPlan_1_manip, ActionPlan_manip, ActionPlan_lang_manip, fix_json
 
 temperature = 0
-max_completion_tokens = 40960
+max_completion_tokens = 4096
 remote_url = os.environ.get('remote_url')
 
 class RemoteModel:
@@ -46,6 +46,8 @@ class RemoteModel:
                 )
             elif "gpt" in self.model_name:
                 self.model = OpenAI()
+            elif "Qwen3.5" in self.model_name:
+                self.model = OpenAI(base_url=remote_url, api_key="EMPTY")
             elif 'qwen' in self.model_name:
                 self.model = OpenAI(
                     api_key=os.getenv("DASHSCOPE_API_KEY"),
@@ -83,6 +85,8 @@ class RemoteModel:
                 return self._call_gemini(message_history)
             elif "gpt" in self.model_name:
                 return self._call_gpt(message_history)
+            elif "Qwen3.5" in self.model_name:
+                return self._call_qwen7b(message_history)
             elif 'qwen' in self.model_name:
                 return self._call_gpt(message_history)
             elif "Qwen3-VL" in self.model_name:
