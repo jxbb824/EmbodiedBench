@@ -20,6 +20,8 @@ template = template
 template_lang = template_lang
 
 MESSAGE_WINDOW_LEN = 5
+MAX_PLAN_ACTIONS = 5
+FALLBACK_ACTION = 4
 
 class EBNavigationPlanner():
     def __init__(self, model_name = '', model_type = 'remote', actions = [], system_prompt = '', examples = '', n_shot=1, obs_key='head_rgb', chat_history=False, language_only=False, multiview = False, multistep = False, visual_icl = False, tp=1, truncate=False, kwargs={}):
@@ -36,6 +38,7 @@ class EBNavigationPlanner():
 
         self.kwargs = kwargs
         self.action_key = kwargs.pop('action_key', 'action_id')
+        self.max_plan_actions = kwargs.pop('max_plan_actions', MAX_PLAN_ACTIONS)
 
         self.multiview = multiview
         self.multistep = multistep
@@ -58,14 +61,16 @@ class EBNavigationPlanner():
 \nAt last, output the action id(s) (0 ~ {len(self.actions)-1}) from the available actions to execute. 
 
 The input given to you is {'an first person view observation' if not self.multistep else 'latest 3 steps of the first person view observations'} {'and a overhead view of the house where the silver circle represents where you locates (Notice:The part hanging on the outside is your arm, and it is on your right side)' if self.multiview else ''}. Plan accordingly based on the visual observation.
+When distance change is available in the history, negative means the last move got closer to the target and positive means it got farther away.
 
 You are supposed to output in JSON.{template_lang if self.language_only else template}'''
 
         self.following_prompt = f'''To achieve the task, 1. Reason about the current visual state and your final goal, and 2. Reflect on the effect of previous actions. 3. Summarize how you learn from the Strategy and Examples provided \
-\nAim for about 5-6 actions in this step to be closer to the target object. !!!Notice: you cannot assess the situation until the whole plan in this planning step is finished executed, so plan accordingly.\
+\nAim for about 1-{self.max_plan_actions} actions in this step to be closer to the target object. !!!Notice: you cannot assess the situation until the whole plan in this planning step is finished executed, so plan accordingly.\
 \nAt last, output the action id(s) (0 ~ {len(self.actions)-1}) from the available actions to execute. 
 
 The input given to you is {'an first person view observation' if not self.multistep else 'latest 3 steps of the first person view observations'} {'and a overhead view of the house where the silver circle represents where you locates (Notice:The part hanging on the outside is your arm, and it is on your right side)' if self.multiview else ''}. Plan accordingly based on the visual observation.
+When distance change is available in the history, negative means the last move got closer to the target and positive means it got farther away.
 
 You are supposed to output in JSON.{template_lang if self.language_only else template}'''
 
@@ -115,7 +120,7 @@ You are supposed to output in JSON.{template_lang if self.language_only else tem
 
             prompt += '\n\n The action history:'
             for i, action_feedback in enumerate(prev_act_feedback):
-                prompt += '\n Step {}, action id {}, {}, env feedback: {}'.format(i, action_feedback[0], self.actions[action_feedback[0]], action_feedback[1])
+                prompt += '\n ' + self._format_action_feedback(i, action_feedback)
 
             prompt += f"\n\n{self.following_prompt}"
 
@@ -129,11 +134,32 @@ You are supposed to output in JSON.{template_lang if self.language_only else tem
 
             prompt += '\n\n The action history:'
             for i, action_feedback in enumerate(prev_act_feedback):
-                prompt += '\n Step {}, action id {}, {}, env feedback: {}'.format(i, action_feedback[0], self.actions[action_feedback[0]], action_feedback[1])
+                prompt += '\n ' + self._format_action_feedback(i, action_feedback)
             
             prompt += f"\n\n{self.following_prompt}"
 
         return prompt
+
+    def _format_action_feedback(self, step_idx, action_feedback):
+        if isinstance(action_feedback, dict):
+            action_id = action_feedback.get('action_id', -1)
+            action_name = action_feedback.get('action_name')
+            if action_name is None and isinstance(action_id, int) and 0 <= action_id < len(self.actions):
+                action_name = self.actions[action_id]
+
+            parts = [f"Step {step_idx}, action id {action_id}, {action_name or 'unknown action'}"]
+            if action_feedback.get('env_feedback'):
+                parts.append(f"env feedback: {action_feedback['env_feedback']}")
+            if 'distance' in action_feedback:
+                parts.append(f"distance to target: {action_feedback['distance']:.2f}")
+            if 'distance_delta' in action_feedback:
+                delta = action_feedback['distance_delta']
+                parts.append(f"distance change after action: {delta:+.2f}")
+            return ', '.join(parts)
+
+        action_id, feedback = action_feedback
+        action_name = self.actions[action_id] if 0 <= action_id < len(self.actions) else 'unknown action'
+        return 'Step {}, action id {}, {}, env feedback: {}'.format(step_idx, action_id, action_name, feedback)
     
 
     def get_message(self, image, prompt, messages=[]):
@@ -238,21 +264,46 @@ You are supposed to output in JSON.{template_lang if self.language_only else tem
             json_object = json.loads(output_text)
             action = [x[self.action_key] for x in json_object[json_key]]
             if not len(action):
-                print('empty plan, using random action instead')
-                action = np.random.randint(len(self.actions))
+                print('empty plan, using fallback action instead')
+                action = [FALLBACK_ACTION]
+            else:
+                action = action[:self.max_plan_actions]
+                for i, act in enumerate(action):
+                    if act >= len(self.actions) or act < 0:
+                        print('found invalid action, using fallback action instead')
+                        action = [FALLBACK_ACTION] if i == 0 else action[:i]
+                        break
         except json.JSONDecodeError as e:
             print("Failed to decode JSON:", e)
-            print('random action')
+            print('using fallback action')
             self.output_json_error += 1
-            action = np.random.randint(len(self.actions))
+            action = [FALLBACK_ACTION]
             valid = False
         except Exception as e:
             # Catch-all for any other unexpected errors not handled specifically
             print("An unexpected error occurred:", e)
-            print('Using random action due to an unexpected error')
-            action = np.random.randint(len(self.actions))
+            print('Using fallback action due to an unexpected error')
+            action = [FALLBACK_ACTION]
             valid = False
         return action, valid
+
+    def validate_action_plan(self, action):
+        if not isinstance(action, list):
+            return action
+
+        last_feedback = self.episode_act_feedback[-1] if self.episode_act_feedback else {}
+        last_action = last_feedback.get('action_id') if isinstance(last_feedback, dict) else None
+        env_feedback = last_feedback.get('env_feedback', '') if isinstance(last_feedback, dict) else ''
+        distance_delta = last_feedback.get('distance_delta') if isinstance(last_feedback, dict) else None
+        last_failed = 'invalid' in env_feedback.lower()
+
+        validated = []
+        for act in action[:self.max_plan_actions]:
+            if (last_failed or (distance_delta is not None and distance_delta > 0)) and act == last_action:
+                continue
+            validated.append(act)
+
+        return validated if validated else [FALLBACK_ACTION]
 
         
     def act_custom(self, prompt, obs):
@@ -264,6 +315,7 @@ You are supposed to output in JSON.{template_lang if self.language_only else tem
         logger.debug(f"Model Output:\n{out}\n")
         self.planner_steps += 1
         action, valid = self.json_to_action(out)
+        action = self.validate_action_plan(action)
         if valid:
             return action, out
         else:
@@ -305,7 +357,7 @@ You are supposed to output in JSON.{template_lang if self.language_only else tem
             out = self.model.respond(messages_to_send)
         except Exception as e:
             print(e)
-            if 'qwen' in self.model_name:
+            if 'qwen' in self.model_name.lower():
                 return -2,'''{"visual_state_description":"qwen model generate empty action due to inappropriate content check", "reasoning_and_reflection":"invalid json, random action",
                    "language_plan":"invalid json, random action"}'''
 
@@ -319,6 +371,7 @@ You are supposed to output in JSON.{template_lang if self.language_only else tem
             
         logger.debug(f"Model Output:\n{out}\n")
         action, valid = self.json_to_action(out)
+        action = self.validate_action_plan(action)
         self.planner_steps += 1
         if valid:
             return action, out
@@ -329,11 +382,20 @@ You are supposed to output in JSON.{template_lang if self.language_only else tem
 
     def update_info(self, info):
         """Update episode feedback history."""
-        self.episode_act_feedback.append([
-            info['action_id'],
-            info['env_feedback']
-        ])
+        feedback = {
+            'action_id': info['action_id'],
+            'action_name': info.get('action_description'),
+            'env_feedback': info.get('env_feedback', ''),
+        }
+        if 'distance' in info:
+            feedback['distance'] = float(info['distance'])
+            previous_distances = [
+                item['distance'] for item in self.episode_act_feedback
+                if isinstance(item, dict) and 'distance' in item
+            ]
+            if previous_distances:
+                feedback['distance_delta'] = feedback['distance'] - previous_distances[-1]
+        self.episode_act_feedback.append(feedback)
 
 
         
-

@@ -329,6 +329,8 @@ class EBAlfEnv(gym.Env):
         info['env_feedback'] = self.get_env_feedback(event)
         info['episode_elapsed_seconds'] = time.time() - self._episode_start_time
         info['last_action_success'] = float(event['success'])
+        inventory = self.env.last_event.metadata.get('inventoryObjects', [])
+        info['holding'] = inventory[0]['objectType'] if inventory else 'None'
         info['object_states'] = {
                                     "cooled_objects" : self.env.cooled_objects,
                                     "heated_objects" : self.env.heated_objects,

@@ -11,6 +11,8 @@ from embodiedbench.planner.remote_model import RemoteModel
 from embodiedbench.planner.custom_model import CustomModel
 from embodiedbench.main import logger
 
+MAX_PLAN_ACTIONS = 5
+
 class VLMPlanner():
     def __init__(self, model_name, model_type, actions, system_prompt, examples, n_shot=0, obs_key='head_rgb', 
                 chat_history=False, language_only=False, use_feedback=True, multistep=0, tp=1, kwargs={}):
@@ -34,6 +36,7 @@ class VLMPlanner():
         self.language_only = language_only
         self.kwargs = kwargs
         self.action_key = kwargs.pop('action_key', 'action_id')
+        self.max_plan_actions = kwargs.pop('max_plan_actions', MAX_PLAN_ACTIONS)
     
     def set_actions(self, actions):
         self.actions = actions
@@ -58,23 +61,20 @@ class VLMPlanner():
 
             prompt += f'\n\n## Now the human instruction is: {user_instruction}.'
             if self.language_only:
-                prompt += f" You are supposed to output in json. You need to output your reasoning steps and plan. At the end, output the action id (0 ~ {len(self.actions)-1}) from the available actions to excute."
+                prompt += f" You are supposed to output in json. You need to output your reasoning steps and plan. At the end, output only the next 1-{self.max_plan_actions} action id(s) (0 ~ {len(self.actions)-1}) from the available actions to excute."
             else:
-                prompt += f" You are supposed to output in json. You need to describe current visual state from the image, output your reasoning steps and plan. At the end, output the action id (0 ~ {len(self.actions)-1}) from the available actions to excute."
+                prompt += f" You are supposed to output in json. You need to describe current visual state from the image, output your reasoning steps and plan. At the end, output only the next 1-{self.max_plan_actions} action id(s) (0 ~ {len(self.actions)-1}) from the available actions to excute."
         
         elif self.chat_history:
             prompt = f'The human instruction is: {user_instruction}.'
             prompt += '\n\n The action history:'
             for i, action_feedback in enumerate(prev_act_feedback):
-                if self.use_feedback:
-                    prompt += '\nStep {}, action id {}, {}, env feedback: {}'.format(i, action_feedback[0], self.actions[action_feedback[0]], action_feedback[1])
-                else:
-                    prompt += '\nStep {}, action id {}, {}'.format(i, action_feedback[0], self.actions[action_feedback[0]])
+                prompt += '\n' + self._format_action_feedback(i, action_feedback)
 
             if self.language_only:
-                prompt += f'''\n\n Considering the above interaction history, to achieve the human instruction: '{user_instruction}', you are supposed to output in json. You need to summarize interaction history {'and environment feedback ' if self.use_feedback else ''}and reason why the last action or plan failed and did not finish the task, output your new plan to achieve the goal from current state. At the end, output the executable plan with action ids(0 ~ {len(self.actions)-1}) from the available actions.'''
+                prompt += f'''\n\n Considering the above interaction history, to achieve the human instruction: '{user_instruction}', you are supposed to output in json. You need to summarize interaction history {'and environment feedback ' if self.use_feedback else ''}and reason why the last action or plan failed and did not finish the task, output your new plan to achieve the goal from current state. At the end, output only the next 1-{self.max_plan_actions} executable action id(s)(0 ~ {len(self.actions)-1}) from the available actions.'''
             else:
-                prompt += f'''\n\n Considering the above interaction history and the current image state, to achieve the human instruction: '{user_instruction}', you are supposed to output in json. You need to describe current visual state from the image, summarize interaction history {'and environment feedback ' if self.use_feedback else ''}and reason why the last action or plan failed and did not finish the task, output your new plan to achieve the goal from current state. At the end, output the excutable plan with action ids(0 ~ {len(self.actions)-1}) from the available actions.'''
+                prompt += f'''\n\n Considering the above interaction history and the current image state, to achieve the human instruction: '{user_instruction}', you are supposed to output in json. You need to describe current visual state from the image, summarize interaction history {'and environment feedback ' if self.use_feedback else ''}and reason why the last action or plan failed and did not finish the task, output your new plan to achieve the goal from current state. At the end, output only the next 1-{self.max_plan_actions} excutable action id(s)(0 ~ {len(self.actions)-1}) from the available actions.'''
         else:
             if self.n_shot >= 1:
                 prompt = self.system_prompt.format(len(self.actions)-1, self.available_action_str, '\n\n'.join([f'## Task Execution Example  {i}: \n {x}' for i,x in enumerate(self.examples[:self.n_shot])])) 
@@ -83,16 +83,35 @@ class VLMPlanner():
             prompt += f'\n\n## Now the human instruction is: {user_instruction}.'
             prompt += '\n\n The action history:'
             for i, action_feedback in enumerate(prev_act_feedback):
-                if self.use_feedback:
-                    prompt += '\nStep {}, action id {}, {}, env feedback: {}'.format(i, action_feedback[0], self.actions[action_feedback[0]], action_feedback[1])
-                else:
-                    prompt += '\nStep {}, action id {}, {}'.format(i, action_feedback[0], self.actions[action_feedback[0]])
+                prompt += '\n' + self._format_action_feedback(i, action_feedback)
 
             if self.language_only:
-                prompt += f'''\n\n Considering the above interaction history, to achieve the human instruction: '{user_instruction}', you are supposed to output in json. You need to summarize interaction history {'and environment feedback ' if self.use_feedback else ''}and reason why the last action or plan failed and did not finish the task, output your new plan to achieve the goal from current state. At the end, output the excutable plan with action ids(0 ~ {len(self.actions)-1}) from the available actions.'''
+                prompt += f'''\n\n Considering the above interaction history, to achieve the human instruction: '{user_instruction}', you are supposed to output in json. You need to summarize interaction history {'and environment feedback ' if self.use_feedback else ''}and reason why the last action or plan failed and did not finish the task, output your new plan to achieve the goal from current state. At the end, output only the next 1-{self.max_plan_actions} excutable action id(s)(0 ~ {len(self.actions)-1}) from the available actions.'''
             else:
-                prompt += f'''\n\n Considering the above interaction history and the current image state, to achieve the human instruction: '{user_instruction}', you are supposed to output in json. You need to describe current visual state from the image, summarize interaction history {'and environment feedback ' if self.use_feedback else ''}and reason why the last action or plan failed and did not finish the task, output your new plan to achieve the goal from current state. At the end, output the excutable plan with action ids(0 ~ {len(self.actions)-1}) from the available actions.'''
+                prompt += f'''\n\n Considering the above interaction history and the current image state, to achieve the human instruction: '{user_instruction}', you are supposed to output in json. You need to describe current visual state from the image, summarize interaction history {'and environment feedback ' if self.use_feedback else ''}and reason why the last action or plan failed and did not finish the task, output your new plan to achieve the goal from current state. At the end, output only the next 1-{self.max_plan_actions} excutable action id(s)(0 ~ {len(self.actions)-1}) from the available actions.'''
         return prompt
+
+    def _format_action_feedback(self, step_idx, action_feedback):
+        if isinstance(action_feedback, dict):
+            action_id = action_feedback.get('action_id', -1)
+            action_name = action_feedback.get('action_name')
+            if action_name is None and isinstance(action_id, int) and 0 <= action_id < len(self.actions):
+                action_name = self.actions[action_id]
+
+            parts = [f"Step {step_idx}, action id {action_id}, {action_name or 'unknown action'}"]
+            if self.use_feedback and action_feedback.get('env_feedback'):
+                parts.append(f"env feedback: {action_feedback['env_feedback']}")
+            if 'task_progress' in action_feedback:
+                parts.append(f"task progress: {action_feedback['task_progress']:.2f}")
+            if action_feedback.get('holding'):
+                parts.append(f"holding: {action_feedback['holding']}")
+            return ', '.join(parts)
+
+        action_id, feedback = action_feedback
+        action_name = self.actions[action_id] if 0 <= action_id < len(self.actions) else 'unknown action'
+        if self.use_feedback:
+            return 'Step {}, action id {}, {}, env feedback: {}'.format(step_idx, action_id, action_name, feedback)
+        return 'Step {}, action id {}, {}'.format(step_idx, action_id, action_name)
     
 
     def get_message(self, image, prompt, messages=[]):
@@ -158,6 +177,7 @@ class VLMPlanner():
                 print('empty plan, stop here')
                 action = -2
             else:
+                action = action[:self.max_plan_actions]
                 # keep action valid
                 for i, act in enumerate(action):
                     if act >= len(self.actions) or act < 0:
@@ -178,6 +198,28 @@ class VLMPlanner():
             action = -1
         return action
 
+    def validate_action_plan(self, action):
+        if not isinstance(action, list):
+            return action
+
+        last_feedback = self.episode_act_feedback[-1] if self.episode_act_feedback else {}
+        last_action = last_feedback.get('action_id') if isinstance(last_feedback, dict) else None
+        env_feedback = last_feedback.get('env_feedback', '') if isinstance(last_feedback, dict) else ''
+        holding = last_feedback.get('holding') if isinstance(last_feedback, dict) else None
+        is_holding = holding not in (None, '', 'None')
+        last_failed = 'invalid' in env_feedback.lower()
+
+        validated = []
+        for act in action[:self.max_plan_actions]:
+            action_name = self.actions[act].lower()
+            if last_failed and act == last_action:
+                continue
+            if is_holding and action_name.startswith('pick up'):
+                continue
+            validated.append(act)
+
+        return validated if validated else -1
+
     
         
     def act_custom(self, prompt, obs):
@@ -187,6 +229,7 @@ class VLMPlanner():
         out = fix_json(out)
         logger.debug(f"Model Output:\n{out}\n")
         action = self.json_to_action(out)
+        action = self.validate_action_plan(action)
         self.planner_steps += 1
         return action, out
 
@@ -248,15 +291,22 @@ class VLMPlanner():
                 }
             )
         action = self.json_to_action(out)
+        action = self.validate_action_plan(action)
         self.planner_steps += 1
         return action, out
 
     def update_info(self, info):
         """Update episode feedback history."""
-        self.episode_act_feedback.append([
-            info['action_id'],
-            info['env_feedback']
-        ])
+        feedback = {
+            'action_id': info['action_id'],
+            'action_name': info.get('action_description'),
+            'env_feedback': info.get('env_feedback', ''),
+        }
+        if 'task_progress' in info:
+            feedback['task_progress'] = float(info['task_progress'])
+        if 'holding' in info:
+            feedback['holding'] = info['holding']
+        self.episode_act_feedback.append(feedback)
 
 
         
