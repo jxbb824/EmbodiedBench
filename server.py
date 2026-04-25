@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 import os
+import time
 from transformers import AutoProcessor, AutoModelForCausalLM, GenerationConfig, Gemma3ForConditionalGeneration
 import torch
 from PIL import Image
@@ -9,6 +10,7 @@ max_token = 1024
 # model_path = 'AIDC-AI/Ovis2-16B'
 # model_path = 'AIDC-AI/Ovis2-34B'
 model_path = 'Qwen/Qwen3.5-9B'
+# model_path = 'Qwen/Qwen3.5-4B'
 # model_path = 'google/gemma-3-12b-it'
 
 # Load the custom model
@@ -119,6 +121,9 @@ class CustomModel:
             ).to(self.model.device)
 
             with torch.inference_mode():
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                start_time = time.perf_counter()
                 generated_ids = self.model.generate(
                     **inputs,
                     max_new_tokens=max_token,
@@ -126,10 +131,20 @@ class CustomModel:
                     temperature=0.0,
                     use_cache=True,
                 )
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                elapsed = time.perf_counter() - start_time
 
             generated_ids_trimmed = [
                 out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
             ]
+            generated_tokens = sum(len(ids) for ids in generated_ids_trimmed)
+            tokens_per_second = generated_tokens / elapsed if elapsed > 0 else 0.0
+            print(
+                f"[throughput] generated_tokens={generated_tokens} "
+                f"elapsed={elapsed:.3f}s tok/s={tokens_per_second:.2f}",
+                flush=True,
+            )
             response = self.processor.batch_decode(
                 generated_ids_trimmed,
                 skip_special_tokens=True,
