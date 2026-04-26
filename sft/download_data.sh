@@ -10,11 +10,22 @@ hf download \
     --repo-type dataset \
     --local-dir "$DATA_DIR/EB-Alfred_trajectory_dataset"
 
-echo ">>> Extracting images ..."
-cd "$DATA_DIR/EB-Alfred_trajectory_dataset"
-if [ -f images.zip ] && [ ! -d images ]; then
-    unzip -q images.zip -d images
-fi
-cd - > /dev/null
+echo ">>> Downloading EB-Nav trajectory dataset ..."
+hf download \
+    EmbodiedBench/EB-Nav_trajectory_dataset \
+    --repo-type dataset \
+    --local-dir "$DATA_DIR/EB-Nav_trajectory_dataset"
 
-echo ">>> Done.  Dataset at: $DATA_DIR/EB-Alfred_trajectory_dataset"
+echo ">>> Extracting images ..."
+for ds in EB-Alfred_trajectory_dataset EB-Nav_trajectory_dataset; do
+    cd "$DATA_DIR/$ds"
+    if [ -f images.zip ] && [ ! -d images ]; then
+        echo "  Extracting $ds/images.zip ..."
+        unzip -q images.zip -d images
+    fi
+    cd - > /dev/null
+done
+
+echo ">>> Done."
+echo "  Alfred: $DATA_DIR/EB-Alfred_trajectory_dataset"
+echo "  Nav:    $DATA_DIR/EB-Nav_trajectory_dataset"

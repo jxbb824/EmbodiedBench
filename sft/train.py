@@ -1,50 +1,57 @@
 """
-EB-ALFRED Vision SFT with Unsloth LoRA for Qwen3.5-9B.
+EB Vision SFT with Unsloth LoRA for Qwen3.5-9B.
+
+Supports ALFRED, Navigation, or both (mixed).
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0 python sft/train.py
+    python sft/train.py --task alf
+    python sft/train.py --task nav
+    python sft/train.py --task both
+    python sft/train.py --task nav --step-mode multi
 
 Prerequisites:
     1. bash sft/download_data.sh
     2. pip install unsloth trl pillow
 """
 
+import argparse
 import json
+import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import torch
-from PIL import Image
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Configuration
+# Hyperparameters
 # ═══════════════════════════════════════════════════════════════════════════════
 MODEL_NAME   = "Qwen/Qwen3.5-9B"
-DATA_DIR     = Path("sft_data/EB-Alfred_trajectory_dataset")
 OUTPUT_DIR   = Path("sft_output")
 MAX_SEQ_LEN  = 8192
 
 LORA_R       = 16
 LORA_ALPHA   = 16
 BATCH_SIZE   = 1
-GRAD_ACCUM   = 4
+GRAD_ACCUM   = 8
 LR           = 5e-5
 NUM_EPOCHS   = 1
 WARMUP_STEPS = 50
 SAVE_STEPS   = 2000
 LOGGING_STEPS = 1
 
-MAX_PLAN_ACTIONS = 5
-ONLY_SUCCESSFUL  = True  # True = only use successful episodes
-MAX_EPISODES     = 700    # 0 = use all; ~700 episodes ≈ 10000 examples
-IMAGE_RESIZE     = 0      # resize images to save RAM (0 = no resize)
+MAX_PLAN_ACTIONS    = 5
+ONLY_SUCCESSFUL     = True
+MAX_EPISODES        = 0        # 0 = use all episodes
 MIN_RESPONSE_TOKENS = 16
 IMAGE_TOKEN_MARGIN  = 512
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# JSON template appended for Qwen3.5 at inference (vlm_planner.py L245-246)
+# JSON format template — appended for Qwen3.5 at inference
+# (planner_utils.template, shared by ALFRED & NAV)
 # ═══════════════════════════════════════════════════════════════════════════════
-VLM_JSON_TEMPLATE = '''
+JSON_TEMPLATE = '''
 The output json format should be {'visual_state_description':str, 'reasoning_and_reflection':str, 'language_plan':str, 'executable_plan':List[{'action_id':int, 'action_name':str}...]}
 The fields in above JSON follows the purpose below:
 1. visual_state_description is for description of current state from the visual image, 
@@ -55,15 +62,124 @@ The fields in above JSON follows the purpose below:
 !!! When generating content for JSON strings, avoid using any contractions or abbreviated forms (like 's, 're, 've, 'll, 'd, n't) that use apostrophes. Instead, write out full forms (is, are, have, will, would, not) to prevent parsing errors in JSON. Please do not output any other thing more than the above-mentioned JSON, do not include ```json and ```!!!.
 '''
 
+TEMPLATE_MARKER = "The output json format should be"
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# Data conversion — mirrors vlm_planner.act() exactly
+# Task-specific: feedback formatting
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _fmt_fb_alf(step_idx: int, entry: dict) -> str:
+    """ALFRED: Step N, action id X, name, env feedback: ..."""
+    aid, aname = entry["action"]
+    parts = [f"Step {step_idx}, action id {aid}, {aname}"]
+    fb = entry.get("env_feedback")
+    if fb:
+        parts.append(f"env feedback: {fb}")
+    return ", ".join(parts)
+
+
+def _fmt_fb_nav(step_idx: int, entry: dict) -> str:
+    """Nav: Step N, action id X, name, env feedback: ..., distance: ..., delta: ..."""
+    aid, aname = entry["action"]
+    parts = [f"Step {step_idx}, action id {aid}, {aname}"]
+    fb = entry.get("env_feedback")
+    if fb:
+        parts.append(f"env feedback: {fb}")
+    if "distance" in entry:
+        parts.append(f"distance to target: {entry['distance']:.2f}")
+    if "distance_delta" in entry:
+        parts.append(f"distance change after action: {entry['distance_delta']:+.2f}")
+    return ", ".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Task-specific: replan suffix (text between action history and JSON template)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _replan_alf(instruction: str, max_aid: int) -> str:
+    """Mirrors vlm_planner.process_prompt() non-first, non-chat_history branch."""
+    return (
+        f"\n\n Considering the above interaction history and the current image state,"
+        f" to achieve the human instruction: '{instruction}',"
+        f" you are supposed to output in json."
+        f" You need to describe current visual state from the image,"
+        f" summarize interaction history and environment feedback"
+        f" and reason why the last action or plan failed and did not finish the task,"
+        f" output your new plan to achieve the goal from current state."
+        f" At the end, output only the next 1-{MAX_PLAN_ACTIONS}"
+        f" excutable action id(s)(0 ~ {max_aid}) from the available actions."
+        f" The task is NOT finished yet — you MUST output at least one action."
+    )
+
+
+def _replan_nav(instruction: str, max_aid: int) -> str:
+    """Mirrors nav_planner.following_prompt (without the trailing JSON template)."""
+    return (
+        f"\n\nTo achieve the task,"
+        f" 1. Reason about the current visual state and your final goal,"
+        f" and 2. Reflect on the effect of previous actions."
+        f" 3. Summarize how you learn from the Strategy and Examples provided "
+        f"\nAim for about 1-{MAX_PLAN_ACTIONS} actions in this step"
+        f" to be closer to the target object."
+        f" !!!Notice: you cannot assess the situation until the whole plan"
+        f" in this planning step is finished executed, so plan accordingly."
+        f"\nAt last, output the action id(s) (0 ~ {max_aid})"
+        f" from the available actions to execute. "
+        f"\n\nThe input given to you is an first person view observation"
+        f" . Plan accordingly based on the visual observation."
+        f"\nWhen distance change is available in the history,"
+        f" negative means the last move got closer to the target"
+        f" and positive means it got farther away."
+        f"\n\nYou are supposed to output in JSON."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Task configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class TaskConfig:
+    name: str
+    data_dir: Path
+    json_files: dict[str, str]                     # {"single": ..., "multi": ...}
+    fmt_feedback: Callable[[int, dict], str]
+    replan_suffix: Callable[[str, int], str]
+    history_line_prefix: str                        # "\n" for alf, "\n " for nav
+
+
+TASKS: dict[str, TaskConfig] = {
+    "alf": TaskConfig(
+        name="alf",
+        data_dir=Path("sft_data/EB-Alfred_trajectory_dataset"),
+        json_files={
+            "single": "eb-alfred_dataset_single_step.json",
+            "multi":  "eb-alfred_dataset_multi_step.json",
+        },
+        fmt_feedback=_fmt_fb_alf,
+        replan_suffix=_replan_alf,
+        history_line_prefix="\n",
+    ),
+    "nav": TaskConfig(
+        name="nav",
+        data_dir=Path("sft_data/EB-Nav_trajectory_dataset"),
+        json_files={
+            "single": "eb-nav_dataset_single_step.json",
+            "multi":  "eb-nav_dataset_multi_step.json",
+        },
+        fmt_feedback=_fmt_fb_nav,
+        replan_suffix=_replan_nav,
+        history_line_prefix="\n ",
+    ),
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared data conversion
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _extract_base_prompt(ep_input: str) -> tuple[str, str]:
-    """
-    ep["input"] = full first-step prompt (system prompt + actions + examples + instruction).
-    Split into (base_prompt, instruction) at the "## Now the human instruction is:" marker.
-    """
+    """Split ep["input"] into (base_prompt, instruction) at the marker."""
     marker = "## Now the human instruction is:"
     idx = ep_input.find(marker)
     if idx == -1:
@@ -74,108 +190,102 @@ def _extract_base_prompt(ep_input: str) -> tuple[str, str]:
     return base, instruction
 
 
-def _format_feedback(step_idx: int, plan_entry: dict) -> str:
-    """Same format as VLMPlanner._format_action_feedback() — dict branch."""
-    aid, aname = plan_entry["action"]
-    parts = [f"Step {step_idx}, action id {aid}, {aname}"]
-    fb = plan_entry.get("env_feedback")
-    if fb:
-        parts.append(f"env feedback: {fb}")
-    return ", ".join(parts)
+def _extract_max_action_id(ep_input: str) -> int:
+    m = re.search(r"\(0 ~ (\d+)\)", ep_input)
+    return int(m.group(1)) if m else 7
 
 
-def _build_user_text_step0(ep_input: str) -> str:
-    """First step: use the stored prompt verbatim + append JSON template."""
-    return ep_input + VLM_JSON_TEMPLATE
-
-
-def _build_user_text_replan(
-    base_prompt: str,
-    instruction: str,
-    prev_steps: list[dict],
-    max_action_id: int,
-) -> str:
-    """Subsequent steps: system prompt + instruction + action history + replan."""
-    prompt = base_prompt
-    prompt += f"## Now the human instruction is: {instruction}."
-    prompt += "\n\n The action history:"
-
-    for i, step in enumerate(prev_steps):
-        plan_entry = step["executable_plan"][0]
-        prompt += "\n" + _format_feedback(i, plan_entry)
-
-    prompt += (
-        f"\n\n Considering the above interaction history and the current image state,"
-        f" to achieve the human instruction: '{instruction}',"
-        f" you are supposed to output in json."
-        f" You need to describe current visual state from the image,"
-        f" summarize interaction history and environment feedback"
-        f" and reason why the last action or plan failed and did not finish the task,"
-        f" output your new plan to achieve the goal from current state."
-        f" At the end, output only the next 1-{MAX_PLAN_ACTIONS}"
-        f" excutable action id(s)(0 ~ {max_action_id}) from the available actions."
-        f" The task is NOT finished yet — you MUST output at least one action."
-    )
-    prompt += VLM_JSON_TEMPLATE
-    return prompt
-
-
-def _build_assistant_text(step: dict) -> str:
-    """Build target JSON from the dataset's pre-existing model output."""
-    plan_entry = step["executable_plan"][0]
-    aid, aname = plan_entry["action"]
-
-    return json.dumps(
-        {
-            "visual_state_description": step["visual_description"],
-            "reasoning_and_reflection": step["reasoning_and_reflection"],
-            "language_plan": step["language_plan"],
-            "executable_plan": [{"action_id": aid, "action_name": aname}],
-        },
-        ensure_ascii=False,
-    )
+def _enrich_distance_deltas(trajectory: list[dict]) -> None:
+    """If steps contain numeric 'distance', compute 'distance_delta' in-place."""
+    prev_dist = None
+    for step in trajectory:
+        for entry in step.get("executable_plan", []):
+            dist = entry.get("distance")
+            if dist is not None:
+                dist = float(dist)
+                entry["distance"] = dist
+                if prev_dist is not None:
+                    entry["distance_delta"] = dist - prev_dist
+                prev_dist = dist
 
 
 def _resolve_image_path(data_dir: Path, img_path: str) -> Path | None:
-    """Find the actual file path on disk."""
     for candidate in [
-        data_dir / "images" / img_path,   # images/images/model/...
-        data_dir / img_path,               # images/model/...
+        data_dir / "images" / img_path,
+        data_dir / img_path,
     ]:
         if candidate.exists():
             return candidate
     return None
 
 
+def _build_user_text_step0(ep_input: str) -> str:
+    """First step: stored prompt + JSON template (avoid duplication)."""
+    if TEMPLATE_MARKER in ep_input:
+        return ep_input
+    return ep_input + JSON_TEMPLATE
 
 
-def convert_episode(episode: dict, data_dir: Path) -> list[dict]:
+def _build_user_text_replan(
+    base_prompt: str,
+    instruction: str,
+    history: list[tuple[int, dict]],
+    max_action_id: int,
+    cfg: TaskConfig,
+) -> str:
+    """Subsequent steps: system prompt + instruction + history + replan suffix."""
+    prompt = base_prompt
+    prompt += f"## Now the human instruction is: {instruction}."
+    prompt += "\n\n The action history:"
+    for step_idx, entry in history:
+        prompt += cfg.history_line_prefix + cfg.fmt_feedback(step_idx, entry)
+    prompt += cfg.replan_suffix(instruction, max_action_id)
+    prompt += JSON_TEMPLATE
+    return prompt
+
+
+def _build_assistant_text(step: dict) -> str:
+    """Build target JSON from dataset fields (works for single & multi step)."""
+    actions = []
+    for entry in step["executable_plan"]:
+        aid, aname = entry["action"]
+        actions.append({"action_id": aid, "action_name": aname})
+    return json.dumps(
+        {
+            "visual_state_description": step.get("visual_description", ""),
+            "reasoning_and_reflection": step.get("reasoning_and_reflection", ""),
+            "language_plan": step.get("language_plan", ""),
+            "executable_plan": actions,
+        },
+        ensure_ascii=False,
+    )
+
+
+def convert_episode(episode: dict, cfg: TaskConfig) -> list[dict]:
     trajectory = episode.get("trajectory", [])
     if not trajectory:
         return []
 
     base_prompt, instruction = _extract_base_prompt(episode["input"])
-
-    # extract max action id from the first-step prompt (e.g. "0 ~ 207")
-    import re
-    m = re.search(r"\(0 ~ (\d+)\)", episode["input"])
-    max_action_id = int(m.group(1)) if m else 200
+    max_action_id = _extract_max_action_id(episode["input"])
+    _enrich_distance_deltas(trajectory)
 
     examples: list[dict] = []
-    for idx, step in enumerate(trajectory):
+    history: list[tuple[int, dict]] = []
+
+    for step in trajectory:
         if not step.get("executable_plan"):
             continue
 
-        img_file = _resolve_image_path(data_dir, step["input_image_path"])
-        if img_file is None:
+        img = _resolve_image_path(cfg.data_dir, step.get("input_image_path", ""))
+        if img is None:
             continue
-        image = str(img_file)
 
-        if idx == 0:
+        if not history:
             user_text = _build_user_text_step0(episode["input"])
         else:
             user_text = _build_user_text_replan(
-                base_prompt, instruction, trajectory[:idx], max_action_id
+                base_prompt, instruction, history, max_action_id, cfg,
             )
 
         asst_text = _build_assistant_text(step)
@@ -186,7 +296,7 @@ def convert_episode(episode: dict, data_dir: Path) -> list[dict]:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "image", "image": image},
+                            {"type": "image", "image": str(img)},
                             {"type": "text", "text": user_text},
                         ],
                     },
@@ -197,96 +307,132 @@ def convert_episode(episode: dict, data_dir: Path) -> list[dict]:
                 ]
             }
         )
+
+        for entry in step["executable_plan"]:
+            history.append((len(history), entry))
+
     return examples
 
 
-def load_dataset(data_dir: Path) -> list[dict]:
-    json_path = data_dir / "eb-alfred_dataset_single_step.json"
+def load_task_episodes(cfg: TaskConfig, step_mode: str) -> list[dict]:
+    json_file = cfg.json_files[step_mode]
+    json_path = cfg.data_dir / json_file
     if not json_path.exists():
-        sys.exit(f"Dataset not found: {json_path}. Run download_data.sh first.")
+        sys.exit(f"Dataset not found: {json_path}. Run: bash sft/download_data.sh")
 
     with open(json_path) as f:
         episodes = json.load(f)
-    print(f"Loaded {len(episodes)} episodes")
+    print(f"[{cfg.name}] Loaded {len(episodes)} episodes from {json_file}")
 
     if ONLY_SUCCESSFUL:
         episodes = [ep for ep in episodes if ep.get("success", 0) == 1.0]
-        print(f"  Filtered to {len(episodes)} successful episodes")
+        print(f"[{cfg.name}]   → {len(episodes)} successful")
 
     if MAX_EPISODES:
         episodes = episodes[:MAX_EPISODES]
-        print(f"  Capped to {len(episodes)} episodes")
+        print(f"[{cfg.name}]   → capped to {MAX_EPISODES}")
 
+    return episodes
+
+
+def build_dataset(task_names: list[str], step_mode: str) -> list[dict]:
     dataset: list[dict] = []
-    skipped = 0
-    for i, ep in enumerate(episodes):
-        if (i + 1) % 100 == 0 or i + 1 == len(episodes):
-            print(f"  Converting: {i+1}/{len(episodes)} episodes, {len(dataset)} examples ...", flush=True)
-        converted = convert_episode(ep, data_dir)
-        if converted:
-            dataset.extend(converted)
-        else:
-            skipped += 1
-
-    print(f"Converted to {len(dataset)} training examples ({skipped} episodes skipped)")
+    for name in task_names:
+        cfg = TASKS[name]
+        episodes = load_task_episodes(cfg, step_mode)
+        skipped = 0
+        for i, ep in enumerate(episodes):
+            if (i + 1) % 100 == 0 or i + 1 == len(episodes):
+                print(
+                    f"[{cfg.name}] Converting: {i+1}/{len(episodes)}, "
+                    f"{len(dataset)} examples ...",
+                    flush=True,
+                )
+            converted = convert_episode(ep, cfg)
+            if converted:
+                dataset.extend(converted)
+            else:
+                skipped += 1
+        print(f"[{cfg.name}] {len(dataset)} total examples ({skipped} skipped)")
     return dataset
 
 
-def _find_subsequence(sequence: list[int], pattern: list[int]) -> int:
-    for idx in range(len(sequence) - len(pattern) + 1):
-        if sequence[idx:idx + len(pattern)] == pattern:
-            return idx
+# ═══════════════════════════════════════════════════════════════════════════════
+# Response-window filter (prevents NaN from all-masked samples)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _find_subsequence(seq: list[int], pattern: list[int]) -> int:
+    for i in range(len(seq) - len(pattern) + 1):
+        if seq[i : i + len(pattern)] == pattern:
+            return i
     return -1
 
 
-def filter_examples_with_visible_response(dataset: list[dict], processor, max_seq_len: int) -> list[dict]:
-    """
-    Response-only training gives NaN loss when truncation removes all assistant
-    tokens and the collator masks the whole sample to -100 labels.
-    """
+def filter_visible_response(dataset: list[dict], processor, max_seq_len: int) -> list[dict]:
     tokenizer = getattr(processor, "tokenizer", processor)
     response_ids = tokenizer("<|im_start|>assistant\n", add_special_tokens=False).input_ids
 
-    kept = []
-    skipped_missing_response = 0
-    skipped_truncated_response = 0
-    for example in dataset:
-        text = processor.apply_chat_template(example["messages"], tokenize=False)
-        token_ids = tokenizer(text, add_special_tokens=False).input_ids
-        response_start = _find_subsequence(token_ids, response_ids)
-        if response_start < 0:
-            skipped_missing_response += 1
+    kept, skip_trunc, skip_miss = [], 0, 0
+    for ex in dataset:
+        text = processor.apply_chat_template(ex["messages"], tokenize=False)
+        ids = tokenizer(text, add_special_tokens=False).input_ids
+        pos = _find_subsequence(ids, response_ids)
+        if pos < 0:
+            skip_miss += 1
             continue
-
-        min_required_len = response_start + len(response_ids) + MIN_RESPONSE_TOKENS + IMAGE_TOKEN_MARGIN
-        if min_required_len > max_seq_len:
-            skipped_truncated_response += 1
+        if pos + len(response_ids) + MIN_RESPONSE_TOKENS + IMAGE_TOKEN_MARGIN > max_seq_len:
+            skip_trunc += 1
             continue
+        kept.append(ex)
 
-        kept.append(example)
-
-    skipped = skipped_missing_response + skipped_truncated_response
     print(
-        f"Response-window filter kept {len(kept)}/{len(dataset)} examples "
-        f"(skipped {skipped_truncated_response} truncated, "
-        f"{skipped_missing_response} missing response marker)."
+        f"Response filter: kept {len(kept)}/{len(dataset)} "
+        f"(truncated {skip_trunc}, missing marker {skip_miss})"
     )
     if not kept:
-        sys.exit("No examples keep assistant labels inside max sequence length.")
-    if skipped:
-        print("Skipped examples would likely create all -100 labels and NaN response-only loss.")
+        sys.exit("No examples survived the response-window filter.")
     return kept
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="EB Vision SFT")
+    p.add_argument("--task", choices=["alf", "nav", "both"], default="alf",
+                    help="Which task(s) to train on")
+    p.add_argument("--step-mode", choices=["single", "multi"], default="single",
+                    help="single-step or multi-step trajectory data")
+    p.add_argument("--max-episodes", type=int, default=None,
+                    help="Override MAX_EPISODES (per task)")
+    return p.parse_args()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Training
 # ═══════════════════════════════════════════════════════════════════════════════
+
 def main() -> None:
+    args = parse_args()
+
+    global MAX_EPISODES
+    if args.max_episodes is not None:
+        MAX_EPISODES = args.max_episodes
+
+    task_names = ["alf", "nav"] if args.task == "both" else [args.task]
+
+    from datetime import datetime
+    run_tag = f"{args.task}_{datetime.now().strftime('%m%d_%H%M')}"
+    run_dir = OUTPUT_DIR / run_tag
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Run directory: {run_dir}")
+
     from unsloth import FastVisionModel
     from unsloth.trainer import UnslothVisionDataCollator
     from trl import SFTTrainer, SFTConfig
 
-    dataset = load_dataset(DATA_DIR)
+    dataset = build_dataset(task_names, args.step_mode)
     if not dataset:
         sys.exit("No training examples. Check data paths / images.")
 
@@ -296,7 +442,8 @@ def main() -> None:
         load_in_4bit=False,
         use_gradient_checkpointing="unsloth",
     )
-    dataset = filter_examples_with_visible_response(dataset, tokenizer, MAX_SEQ_LEN)
+
+    dataset = filter_visible_response(dataset, tokenizer, MAX_SEQ_LEN)
 
     model = FastVisionModel.get_peft_model(
         model,
@@ -339,9 +486,8 @@ def main() -> None:
             optim="adamw_8bit",
             weight_decay=0.01,
             lr_scheduler_type="cosine",
-            # max_grad_norm=1.0,
             seed=3407,
-            output_dir=str(OUTPUT_DIR),
+            output_dir=str(run_dir),
             report_to="none",
             fp16=not torch.cuda.is_bf16_supported(),
             bf16=torch.cuda.is_bf16_supported(),
@@ -355,7 +501,7 @@ def main() -> None:
     print("Starting training ...")
     trainer.train()
 
-    lora_dir = OUTPUT_DIR / "lora"
+    lora_dir = run_dir / "lora"
     model.save_pretrained(str(lora_dir))
     tokenizer.save_pretrained(str(lora_dir))
     print(f"LoRA adapter saved to {lora_dir}")
