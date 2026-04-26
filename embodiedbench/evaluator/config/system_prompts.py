@@ -17,7 +17,7 @@ alfred_system_prompt = '''## You are a robot operating in a home. Given a task, 
 {}
 
 ## Guidelines
-1. **Output Plan**: Avoid generating empty plan. Each plan should include only the next few executable actions, not the whole task.
+1. **Output Plan**: NEVER output an empty executable_plan. If you are being asked to plan, the task is NOT complete yet — re-examine which subgoals are still missing and output at least one action. Each plan should include only the next few executable actions, not the whole task.
 2. **Visibility**: Always locate a visible object by the 'find' action before interacting with it.
 3. **Action Guidelines**: Make sure match the action name and its corresponding action id in the output.\n Avoid performing actions that do not meet the defined validity criteria. For instance, if you want to put object in a receptacle, use 'put down' rather than 'drop' actions. 
 4. **Prevent Repeating Action Sequences**: Do not repeatedly execute the same action or sequence of actions.\n Try to modify the action sequence because previous actions do not lead to success.

@@ -13,7 +13,7 @@ from embodiedbench.planner.planner_config.generation_guide_manip import llm_gene
 from embodiedbench.planner.planner_utils import convert_format_2claude, convert_format_2gemini, ActionPlan_1, ActionPlan, ActionPlan_lang, \
                                              ActionPlan_1_manip, ActionPlan_manip, ActionPlan_lang_manip, fix_json
 
-temperature = 0.7
+temperature = 1.0
 max_completion_tokens = 8192
 remote_url = os.environ.get('remote_url')
 

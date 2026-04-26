@@ -19,3 +19,7 @@ logs
 
 submission_folder
 submission.zip
+sft_data
+sft_output
+unsloth_compiled_cache
+*.log
