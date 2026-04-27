@@ -34,6 +34,7 @@ class VLMPlanner():
         self.planner_steps = 0
         self.output_json_error = 0
         self.language_only = language_only
+        self.holding = None
         self.kwargs = kwargs
         self.action_key = kwargs.pop('action_key', 'action_id')
         self.max_plan_actions = kwargs.pop('max_plan_actions', MAX_PLAN_ACTIONS)
@@ -158,6 +159,7 @@ class VLMPlanner():
         self.episode_act_feedback = []
         self.planner_steps = 0
         self.output_json_error = 0
+        self.holding = None
 
     def language_to_action(self, output_text):
         pattern = r'\*\*\d+\*\*'
@@ -304,8 +306,14 @@ class VLMPlanner():
         }
         if 'task_progress' in info:
             feedback['task_progress'] = float(info['task_progress'])
-        if 'holding' in info:
-            feedback['holding'] = info['holding']
+        if float(info.get('last_action_success', 0) or 0) > 0:
+            action_name = feedback['action_name'] or ''
+            pickup_match = re.match(r'pick up (?:the |a |an )?(.+)$', action_name, flags=re.I)
+            if pickup_match:
+                self.holding = pickup_match.group(1).strip()
+            elif re.match(r'(put down|drop) ', action_name, flags=re.I):
+                self.holding = None
+        feedback['holding'] = self.holding or 'None'
         self.episode_act_feedback.append(feedback)
 
 
