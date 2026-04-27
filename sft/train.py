@@ -406,6 +406,8 @@ def parse_args() -> argparse.Namespace:
                     help="single-step or multi-step trajectory data")
     p.add_argument("--max-episodes", type=int, default=None,
                     help="Override MAX_EPISODES (per task)")
+    p.add_argument("--include-failed", action="store_true",
+                    help="Use all episodes instead of only successful episodes")
     return p.parse_args()
 
 
@@ -416,9 +418,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    global MAX_EPISODES
+    global MAX_EPISODES, ONLY_SUCCESSFUL
     if args.max_episodes is not None:
         MAX_EPISODES = args.max_episodes
+    if args.include_failed:
+        ONLY_SUCCESSFUL = False
 
     task_names = ["alf", "nav"] if args.task == "both" else [args.task]
 
