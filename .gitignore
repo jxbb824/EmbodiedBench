@@ -24,3 +24,4 @@ sft_output
 unsloth_compiled_cache
 *.log
 rl_data
+rl_output
