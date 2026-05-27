@@ -9,6 +9,11 @@ from embodiedbench.planner.planner_config.generation_guide import llm_generation
 from embodiedbench.planner.planner_utils import local_image_to_data_url, template, template_lang, fix_json
 from embodiedbench.planner.remote_model import RemoteModel
 from embodiedbench.planner.custom_model import CustomModel
+from embodiedbench.planner.custom_prompts import (
+    ALFRED_CUSTOM_SYSTEM_PROMPT,
+    ALFRED_NSHOT_OVERRIDE,
+    is_submitted_alfred_model,
+)
 from embodiedbench.main import logger
 
 MAX_PLAN_ACTIONS = 5
@@ -18,9 +23,17 @@ class VLMPlanner():
                 chat_history=False, language_only=False, use_feedback=True, multistep=0, tp=1, kwargs={}):
         self.model_name = model_name
         self.obs_key = obs_key
-        self.system_prompt = system_prompt
+        # Stage-2 customization: when the served model is one of our submitted
+        # ALFRED checkpoints, swap in the planner-side system prompt and
+        # override n_shot so the upstream evaluator/config files can stay
+        # untouched.
+        if is_submitted_alfred_model(model_name):
+            self.system_prompt = ALFRED_CUSTOM_SYSTEM_PROMPT
+            self.n_shot = ALFRED_NSHOT_OVERRIDE
+        else:
+            self.system_prompt = system_prompt
+            self.n_shot = n_shot
         self.examples = examples
-        self.n_shot = n_shot
         self.chat_history = chat_history # whether to includ all the chat history for prompting
         self.set_actions(actions)
         self.model_type = model_type

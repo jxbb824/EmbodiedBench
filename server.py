@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 import os
-import time
-from transformers import AutoProcessor, AutoModelForCausalLM, GenerationConfig, Gemma3ForConditionalGeneration
+from transformers import AutoProcessor, AutoModelForCausalLM, GenerationConfig, pipeline, Gemma3ForConditionalGeneration
 import torch
 from PIL import Image
 
@@ -9,9 +8,7 @@ max_token = 1024
 # model_path = "microsoft/Phi-4-multimodal-instruct"
 # model_path = 'AIDC-AI/Ovis2-16B'
 # model_path = 'AIDC-AI/Ovis2-34B'
-model_path = 'Qwen/Qwen3.5-9B'
-# model_path = 'Qwen/Qwen3.5-4B'
-# model_path = 'google/gemma-3-12b-it'
+model_path = 'google/gemma-3-12b-it'
 
 # Load the custom model
 class CustomModel:
@@ -43,15 +40,6 @@ class CustomModel:
             self.model = Gemma3ForConditionalGeneration.from_pretrained(
                 model_path, device_map="auto", torch_dtype=torch.bfloat16,
                 attn_implementation="eager"
-            )
-            self.processor = AutoProcessor.from_pretrained(model_path)
-        elif 'Qwen3.5' in model_path:
-            from transformers import Qwen3_5ForConditionalGeneration
-
-            self.model = Qwen3_5ForConditionalGeneration.from_pretrained(
-                model_path,
-                device_map="auto",
-                torch_dtype=torch.bfloat16,
             )
             self.processor = AutoProcessor.from_pretrained(model_path)
 
@@ -101,55 +89,6 @@ class CustomModel:
                 )
                 output_ids = self.model.generate(input_ids,  pixel_values=pixel_values, attention_mask=attention_mask, **gen_kwargs)[0]
                 response = self.text_tokenizer.decode(output_ids, skip_special_tokens=True)
-        elif 'Qwen3.5' in self.model_path:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image_path},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ]
-            inputs = self.processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-                enable_thinking=False,
-            ).to(self.model.device)
-
-            with torch.inference_mode():
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                start_time = time.perf_counter()
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_token,
-                    do_sample=False,
-                    temperature=0.0,
-                    use_cache=True,
-                )
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                elapsed = time.perf_counter() - start_time
-
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            generated_tokens = sum(len(ids) for ids in generated_ids_trimmed)
-            tokens_per_second = generated_tokens / elapsed if elapsed > 0 else 0.0
-            print(
-                f"[throughput] generated_tokens={generated_tokens} "
-                f"elapsed={elapsed:.3f}s tok/s={tokens_per_second:.2f}",
-                flush=True,
-            )
-            response = self.processor.batch_decode(
-                generated_ids_trimmed,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )[0]
         else:
             messages = [
                 {

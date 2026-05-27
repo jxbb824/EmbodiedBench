@@ -14,6 +14,10 @@ from embodiedbench.planner.remote_model import RemoteModel
 from embodiedbench.planner.custom_model import CustomModel
 from embodiedbench.evaluator.config.visual_icl_examples.eb_navigation.ebnav_visual_icl import create_example_json_list
 from embodiedbench.planner.planner_utils import template, template_lang
+from embodiedbench.planner.custom_prompts import (
+    NAV_CUSTOM_SYSTEM_PROMPT,
+    is_submitted_nav_model,
+)
 from embodiedbench.main import logger
 
 template = template
@@ -28,7 +32,13 @@ class EBNavigationPlanner():
         self.model_name = model_name
         self.model_type = model_type
         self.obs_key = obs_key
-        self.system_prompt = system_prompt
+        # Stage-2 customization: when the served model is one of our submitted
+        # navigation checkpoints, swap in the planner-side system prompt so the
+        # upstream evaluator/config files can stay untouched.
+        if is_submitted_nav_model(model_name):
+            self.system_prompt = NAV_CUSTOM_SYSTEM_PROMPT
+        else:
+            self.system_prompt = system_prompt
         self.n_shot = n_shot
         self.chat_history = chat_history # whether to includ all the chat history for prompting
         self.truncate = truncate # whether to truncate message history when chat_history is True

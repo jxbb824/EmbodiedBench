@@ -7,7 +7,7 @@ import json
 import os
 import sys
 import math
-from ai2thor.platform import Linux64
+from ai2thor.platform import CloudRendering
 from embodiedbench.envs.eb_navigation.utils import draw_target_box, draw_boxes
 from embodiedbench.main import logger
 import copy
@@ -56,8 +56,7 @@ class EBNavigationEnv(gym.Env):
             "width": self.resolution,
             "height": self.resolution,
             "fieldOfView": fov,
-            "platform": Linux64,
-            "x_display": os.environ.get("DISPLAY", ":1"),
+            "platform": CloudRendering
         }
         self.env = ai2thor.controller.Controller(**self.config)
 
