@@ -25,3 +25,4 @@ unsloth_compiled_cache
 *.log
 rl_data
 rl_output
+challenge_report/
