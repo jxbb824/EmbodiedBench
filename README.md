@@ -7,73 +7,63 @@ EmbodiedBench: Comprehensive Benchmarking Multi-modal Large Language Models for 
 
 # Stage-2 Submission — Team233
 
-This fork is Team233's Stage-2 submission to the CVPR 2026 FMEA EmbodiedBench Challenge. It uses **Option A + B**: two fine-tuned Qwen3.5-VL-9B checkpoints served via vLLM plus a customized planner under `embodiedbench/planner/`. Everything outside `embodiedbench/planner/` is the unmodified upstream code (evaluator, environments, configs, metrics).
+CVPR 2026 FMEA EmbodiedBench Challenge, Option A + B. Only `embodiedbench/planner/` is modified; the upstream evaluator / environments / configs / metrics are byte-identical to upstream.
 
-## Models (Option A)
+## Models
 
-Two fine-tuned 9B checkpoints, one per task. Each is served separately.
+| Task          | Served name           | Hugging Face                                                                |
+|---------------|-----------------------|-----------------------------------------------------------------------------|
+| EB-ALFRED     | `Qwen3.5-Alf-SFT`     | [jxbb233/Qwen3.5-Alf-SFT](https://huggingface.co/jxbb233/Qwen3.5-Alf-SFT)   |
+| EB-Navigation | `Qwen3.5-Nav-RL`      | [jxbb233/Qwen3.5-Nav-RL](https://huggingface.co/jxbb233/Qwen3.5-Nav-RL)     |
 
-| Task | Served name | Description | Download |
-|---|---|---|---|
-| EB-ALFRED | `Qwen3.5-Alf-SFT` | Qwen3.5-VL-9B + LoRA SFT on successful EB-ALFRED multi-step trajectories, merged | TODO: add Hugging Face / Drive link |
-| EB-Navigation | `Qwen3.5-Nav-RL` | Qwen3.5-VL-9B + Unsloth-GRPO (initialized from the base 9B) on replayed Nav states, merged | TODO: add Hugging Face / Drive link |
-
-The exact served names (`Qwen3.5-Alf-SFT`, `Qwen3.5-Nav-RL`) **must be preserved**: the planner uses substring matching on the served name to (a) route through the OpenAI-compatible vLLM client in `remote_model.py` and (b) swap in the Stage-2 system prompts inside `vlm_planner.py` / `nav_planner.py`.
-
-## Planner customizations (Option B)
-
-All changes vs. upstream live under `embodiedbench/planner/`:
-
-- `embodiedbench/planner/custom_prompts.py` *(new)* — Stage-2 ALFRED and Nav system prompts plus the model-name detectors. The planners overwrite `self.system_prompt` here at construction time so the upstream `embodiedbench/evaluator/config/system_prompts.py` stays byte-identical to upstream.
-- `embodiedbench/planner/vlm_planner.py` — adds plan-length capping, an action validator that drops repeated invalid pick-ups when the agent is already holding an object, dict-based history feedback with `task_progress` / `holding`, and the Stage-2 prompt override (when the served model is `Qwen3.5-Alf-SFT`, also overrides `n_shot=5`).
-- `embodiedbench/planner/nav_planner.py` — adds distance-change feedback in the action history, plan-length capping, a fallback action on JSON/empty errors, an action validator that drops repeated failed/regressing moves, and the Stage-2 prompt override.
-- `embodiedbench/planner/remote_model.py` — adds a `Qwen3.5` branch that talks to a local vLLM OpenAI-compatible endpoint (`remote_url` env var) with `temperature=1.0` and `max_completion_tokens=8192`.
-
-The planner relies only on fields already provided by the upstream environments (`info['distance']` in `EBNavEnv.py`, `info['task_progress']` / `info['last_action_success']` / `info['action_description']` in `EBAlfEnv.py`).
+The served name **must match exactly** — the planner uses substring matching on it to route to the vLLM endpoint and to swap in the Stage-2 system prompt.
 
 ## How to run
 
-### 1. Install the upstream EmbodiedBench environments
+### 1. Install EmbodiedBench (upstream `install.sh`)
 
-Follow the standard upstream install: a single conda env per environment, then `pip install -e .` inside each. For Stage-2 only the ALFRED and Navigation envs are needed.
+The ALFRED and Navigation conda envs are enough; you can skip Habitat and Manipulation.
 
 ```bash
-conda env create -f conda_envs/environment.yaml         # creates `embench` (EB-ALFRED)
+conda env create -f conda_envs/environment.yaml         # creates `embench`
 conda activate embench && pip install -e .
 
-conda env create -f conda_envs/environment_eb-nav.yaml  # creates `embench_nav` (EB-Navigation)
+conda env create -f conda_envs/environment_eb-nav.yaml  # creates `embench_nav`
 conda activate embench_nav && pip install -e .
+
+# EB-ALFRED dataset
+conda activate embench
+git clone https://huggingface.co/datasets/EmbodiedBench/EB-ALFRED
+mv EB-ALFRED embodiedbench/envs/eb_alfred/data/json_2.1.0
 ```
 
-EB-ALFRED dataset / EB-Habitat / EB-Manipulation steps from `install.sh` are unchanged. Only the ALFRED dataset clone (`git clone https://huggingface.co/datasets/EmbodiedBench/EB-ALFRED ...`) is required for our submission.
+### 2. Install vLLM in its own env
 
-### 2. Create a separate env for vLLM
-
-Our checkpoints are Qwen3.5-VL-9B (Qwen-thinking disabled). The `embench` env is not built for vLLM serving, so create a small dedicated env and install vLLM following its own instructions (https://docs.vllm.ai/en/latest/getting_started/installation.html). A minimal setup:
+vLLM does not coexist well with the `embench` / `embench_nav` envs, so use a dedicated one. Follow the [official vLLM install guide](https://docs.vllm.ai/en/latest/getting_started/installation.html); a minimal version:
 
 ```bash
 conda create -n vllm python=3.10 -y
 conda activate vllm
-pip install vllm           # follow the vLLM install guide for your CUDA/driver
+pip install vllm
 ```
 
-### 3. Run the evaluation
+### 3. Evaluate
 
-The submission requires **two separate runs** — one per task — because each task uses its own model. Both runs share the same calling convention: launch vLLM on port 8000, then run `embodiedbench.main` from the corresponding conda env, pointing `remote_url` at the vLLM endpoint.
+Run the two tasks **sequentially** (each uses its own model). For each task: start vLLM in one terminal, then run the evaluator in another with `remote_url` pointing at it.
 
-#### 3a. EB-ALFRED
+#### EB-ALFRED
 
 ```bash
-# Terminal A — vLLM server
+# Terminal A
 conda activate vllm
-vllm serve /path/to/Qwen3.5-Alf-SFT \
+vllm serve jxbb233/Qwen3.5-Alf-SFT \
   --served-model-name Qwen3.5-Alf-SFT \
   --host 0.0.0.0 --port 8000 \
   --reasoning-parser qwen3 \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
   --max-model-len 32768
 
-# Terminal B — evaluator
+# Terminal B
 conda activate embench
 export remote_url=http://127.0.0.1:8000/v1
 python -m embodiedbench.main \
@@ -83,19 +73,19 @@ python -m embodiedbench.main \
   exp_name=stage2_alf
 ```
 
-#### 3b. EB-Navigation
+#### EB-Navigation
 
 ```bash
-# Terminal A — vLLM server (replace the ALFRED one)
+# Terminal A (stop the previous vllm first)
 conda activate vllm
-vllm serve /path/to/Qwen3.5-Nav-RL \
+vllm serve jxbb233/Qwen3.5-Nav-RL \
   --served-model-name Qwen3.5-Nav-RL \
   --host 0.0.0.0 --port 8000 \
   --reasoning-parser qwen3 \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
   --max-model-len 32768
 
-# Terminal B — evaluator
+# Terminal B
 conda activate embench_nav
 export remote_url=http://127.0.0.1:8000/v1
 python -m embodiedbench.main \
@@ -105,11 +95,7 @@ python -m embodiedbench.main \
   exp_name=stage2_nav
 ```
 
-The required vLLM flags are:
-- `--reasoning-parser qwen3` and `--default-chat-template-kwargs '{"enable_thinking": false}'` — disables Qwen3's thinking trace, which is necessary because our training data is non-thinking JSON.
-- `--max-model-len 32768` — needed because the planner prompts (with history and few-shot examples) can be longer than the default context.
-
-The served-model-name and the evaluator's `model_name` must match exactly (`Qwen3.5-Alf-SFT` or `Qwen3.5-Nav-RL`); the planner uses substring matching on this name to apply Stage-2-specific behavior.
+The three vLLM flags (`--reasoning-parser qwen3`, `--default-chat-template-kwargs '{"enable_thinking": false}'`, `--max-model-len 32768`) and the exact `--served-model-name` are required; everything else can be tuned for the hardware.
 
 ---
 
